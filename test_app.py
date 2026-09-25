@@ -302,6 +302,136 @@ class TestApp(unittest.TestCase):
             self.assertEqual(res.status_code, 200)
             self.assertEqual(res.get_json()["username"], "wrapped_user")
 
+    def test_cookie_upload_netscape_with_httponly_prefix(self):
+        """Verify Netscape cookies with #HttpOnly_ prefixes retain sessionid."""
+        mock_stream = MagicMock()
+        mock_stream.getAccountInfo.return_value = {
+            "account": {"username": "httponly_user", "screen_name": "HttpOnly Display"},
+            "can_go_live": True,
+            "status": "Ready"
+        }
+        with patch('app.Stream', return_value=mock_stream):
+            content = (
+                "# Netscape HTTP Cookie File\n"
+                "#HttpOnly_.tiktok.com\tTRUE\t/\tTRUE\t1758652800\tsessionid\thttponly_secret_val\n"
+                ".tiktok.com\tTRUE\t/\tTRUE\t1758652800\ttt_csrf_token\tcsrf_123\n"
+            )
+            data = {'file': (io.BytesIO(content.encode('utf-8')), 'cookies.txt')}
+            res = self.client.post('/api/login/cookies', data=data, content_type='multipart/form-data')
+            self.assertEqual(res.status_code, 200)
+            res_data = res.get_json()
+            self.assertTrue(res_data["success"])
+            self.assertEqual(res_data["username"], "httponly_user")
+
+            cookies_file = flask_app.get_cookies_path()
+            with open(cookies_file, encoding='utf-8') as f:
+                saved = json.load(f)
+            names = [c["name"] for c in saved]
+            self.assertIn("sessionid", names)
+
+    def test_cookie_upload_json_key_value_map(self):
+        """Verify JSON dict mapping name -> value is parsed properly."""
+        mock_stream = MagicMock()
+        mock_stream.getAccountInfo.return_value = {
+            "account": {"username": "kv_user", "screen_name": "KV User"},
+            "can_go_live": True,
+            "status": "Ready"
+        }
+        with patch('app.Stream', return_value=mock_stream):
+            kv_map = {"sessionid": "kv_sess_val", "ttwid": "kv_ttwid_val"}
+            data = {'file': (io.BytesIO(json.dumps(kv_map).encode('utf-8')), 'cookies.json')}
+            res = self.client.post('/api/login/cookies', data=data, content_type='multipart/form-data')
+            self.assertEqual(res.status_code, 200)
+            self.assertTrue(res.get_json()["success"])
+            self.assertEqual(res.get_json()["username"], "kv_user")
+
+    def test_cookie_upload_raw_header_cookie_prefix(self):
+        """Verify raw cookie header string with 'Cookie: ' prefix parses sessionid cleanly."""
+        mock_stream = MagicMock()
+        mock_stream.getAccountInfo.return_value = {
+            "account": {"username": "prefix_user", "screen_name": "Prefix User"},
+            "can_go_live": True,
+            "status": "Ready"
+        }
+        with patch('app.Stream', return_value=mock_stream):
+            raw = "Cookie: sessionid=val_with_prefix; ttwid=val2"
+            data = {'file': (io.BytesIO(raw.encode('utf-8')), 'cookies.txt')}
+            res = self.client.post('/api/login/cookies', data=data, content_type='multipart/form-data')
+            self.assertEqual(res.status_code, 200)
+            self.assertEqual(res.get_json()["username"], "prefix_user")
+
+            cookies_file = flask_app.get_cookies_path()
+            with open(cookies_file, encoding='utf-8') as f:
+                saved = json.load(f)
+            names = [c["name"] for c in saved]
+            self.assertIn("sessionid", names)
+            self.assertNotIn("Cookie: sessionid", names)
+
+    def test_account_session_expired_handling(self):
+        """Verify that account_info_error is NOT treated as username and status is session_expired."""
+        with open(flask_app.get_cookies_path(), "w", encoding='utf-8') as f:
+            json.dump([{"name": "sessionid", "value": "expired_val"}], f)
+
+        mock_stream = MagicMock()
+        mock_stream.getAccountInfo.return_value = {
+            "account": {
+                "name": "account_info_error",
+                "description": "session expired, please sign in again",
+                "error_code": 13,
+                "user_id": 0
+            },
+            "can_go_live": False,
+            "status": "Restricted"
+        }
+
+        with patch('app.Stream', return_value=mock_stream):
+            flask_app.stream = None
+            res = self.client.get('/api/account')
+            self.assertEqual(res.status_code, 200)
+            acc = res.get_json()
+            self.assertEqual(acc["username"], "")
+            self.assertEqual(acc["status"], "session_expired")
+            self.assertIn("session expired", acc["message"].lower())
+
+    def test_account_resolves_unique_id_and_nickname(self):
+        """Verify unique_id and nickname are extracted when username is missing."""
+        with open(flask_app.get_cookies_path(), "w", encoding='utf-8') as f:
+            json.dump([{"name": "sessionid", "value": "val"}], f)
+
+        mock_stream = MagicMock()
+        mock_stream.getAccountInfo.return_value = {
+            "account": {
+                "unique_id": "gamer_unique",
+                "nickname": "Gamer Nickname",
+                "user_id_str": "12345"
+            },
+            "can_go_live": True,
+            "status": "Ready"
+        }
+
+        with patch('app.Stream', return_value=mock_stream):
+            flask_app.stream = None
+            res = self.client.get('/api/account')
+            self.assertEqual(res.status_code, 200)
+            acc = res.get_json()
+            self.assertEqual(acc["username"], "gamer_unique")
+            self.assertEqual(acc["screen_name"], "Gamer Nickname")
+
+    def test_cookie_upload_json_paste(self):
+        """Verify pasting cookies via JSON payload to /api/login/cookies works."""
+        mock_stream = MagicMock()
+        mock_stream.getAccountInfo.return_value = {
+            "account": {"username": "pasted_user", "screen_name": "Pasted User"},
+            "can_go_live": True,
+            "status": "Ready"
+        }
+        with patch('app.Stream', return_value=mock_stream):
+            payload = {"cookies": "sessionid=pasted_sess; ttwid=pasted_ttwid"}
+            res = self.client.post('/api/login/cookies', json=payload)
+            self.assertEqual(res.status_code, 200)
+            self.assertTrue(res.get_json()["success"])
+            self.assertEqual(res.get_json()["username"], "pasted_user")
+
 if __name__ == '__main__':
     unittest.main()
 

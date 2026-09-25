@@ -31,9 +31,16 @@ export const getStats = () => request(`${API}/stats`);
 export const getAudience = () => request(`${API}/audience`);
 export const getViolations = () => request(`${API}/violations`);
 export const getQuota = () => request(`${API}/quota`);
-export const uploadCookies = (file) => {
+export const uploadCookies = (fileOrContent) => {
+    if (typeof fileOrContent === 'string') {
+        return request(`${API}/login/cookies`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ cookies: fileOrContent })
+        });
+    }
     const fd = new FormData();
-    fd.append('file', file);
+    fd.append('file', fileOrContent);
     return request(`${API}/login/cookies`, { method: 'POST', body: fd });
 };
 

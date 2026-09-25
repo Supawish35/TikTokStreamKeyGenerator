@@ -102,56 +102,105 @@ def init_stream():
                     device_id = "7689175736356292117"
                     install_id = "7689177697239222036"
             stream = Stream(cookies_path=cookies_path)
+            # Ensure sessionid <-> sessionid_ss sync in session jar without altering file count
+            if hasattr(stream, "s") and hasattr(stream.s, "cookies"):
+                if "sessionid" in stream.s.cookies and "sessionid_ss" not in stream.s.cookies:
+                    stream.s.cookies.set("sessionid_ss", stream.s.cookies.get("sessionid"))
+                elif "sessionid_ss" in stream.s.cookies and "sessionid" not in stream.s.cookies:
+                    stream.s.cookies.set("sessionid", stream.s.cookies.get("sessionid_ss"))
         except Exception as e:
             stream = None
             return False, f"Failed to initialize stream with cookies: {str(e)}"
     return True, None
 
+def _extract_avatar(data):
+    if not isinstance(data, dict):
+        return ""
+    for key in ("avatar_url", "avatar_thumb", "avatar_medium", "avatar_larger"):
+        val = data.get(key)
+        if isinstance(val, str) and val:
+            return val
+        if isinstance(val, dict):
+            urls = val.get("url_list") or []
+            if urls and isinstance(urls[0], str) and urls[0]:
+                return urls[0]
+    return ""
+
+def _finalize_cookies(cookies):
+    """
+    Deduplicates cookies preserving the last occurrence of each cookie name.
+    """
+    seen = {}
+    for c in cookies:
+        name = c.get("name")
+        if name:
+            seen[name] = c
+    return list(seen.values())
+
 def parse_cookies_content(content: str):
     """
-    Parses cookies from JSON (list, wrapper dict), Netscape format, or raw header string.
+    Parses cookies from JSON (list, wrapper dict, key-value dict), Netscape format, or raw header string.
     Returns a list of dicts each with at least 'name' and 'value'.
     """
     if not content:
         return []
 
     content_clean = content.strip()
+    parsed = []
 
     # 1. Try JSON parsing
     try:
         data = json.loads(content_clean)
+        # Handle dict formats: {"cookies": [...]}, {"Cookie": [...]}, {"data": {"cookies": [...]}}
         if isinstance(data, dict):
             if isinstance(data.get("cookies"), list):
                 data = data["cookies"]
             elif isinstance(data.get("Cookie"), list):
                 data = data["Cookie"]
+            elif isinstance(data.get("data"), dict) and isinstance(data["data"].get("cookies"), list):
+                data = data["data"]["cookies"]
             elif "name" in data and "value" in data:
                 data = [data]
             else:
-                data = []
+                # Key-value dictionary: {"sessionid": "...", "ttwid": "..."}
+                kv_items = []
+                sub_dict = data.get("cookies") if isinstance(data.get("cookies"), dict) else data
+                for k, v in sub_dict.items():
+                    if isinstance(v, (str, int, float, bool)):
+                        kv_items.append({"name": str(k).strip(), "value": str(v).strip()})
+                if kv_items:
+                    data = kv_items
+
         if isinstance(data, list):
-            cookies = []
             for item in data:
                 if isinstance(item, dict):
                     name = item.get("name")
                     value = item.get("value")
                     if name not in (None, "") and value is not None:
                         entry = dict(item)
-                        entry["name"] = str(name)
-                        entry["value"] = str(value)
-                        cookies.append(entry)
-            if cookies:
-                return cookies
+                        entry["name"] = str(name).strip()
+                        entry["value"] = str(value).strip()
+                        parsed.append(entry)
+            if parsed:
+                return _finalize_cookies(parsed)
     except Exception:
         pass
 
-    # 2. Try Netscape format (tab-separated lines)
+    # 2. Try Netscape format (tab-separated lines, including #HttpOnly_ prefixes)
     netscape_cookies = []
     lines = content_clean.splitlines()
     for line in lines:
         line = line.strip()
-        if not line or line.startswith('#'):
+        if not line:
             continue
+        # Standard Netscape exporters (like "Get cookies.txt LOCALLY") prefix HttpOnly cookies with #HttpOnly_
+        is_http_only = False
+        if line.lower().startswith('#httponly_'):
+            is_http_only = True
+            line = line[len('#httponly_'):].strip()
+        elif line.startswith('#'):
+            continue
+
         parts = line.split('\t')
         if len(parts) >= 7:
             netscape_cookies.append({
@@ -160,19 +209,26 @@ def parse_cookies_content(content: str):
                 "path": parts[2],
                 "secure": parts[3].upper() == "TRUE" or parts[3] == "1",
                 "expiration": int(parts[4]) if parts[4].lstrip('-').isdigit() else -1,
-                "name": str(parts[5]),
-                "value": str(parts[6])
+                "name": str(parts[5]).strip(),
+                "value": str(parts[6]).strip(),
+                "httpOnly": is_http_only
             })
     if netscape_cookies:
-        return netscape_cookies
+        return _finalize_cookies(netscape_cookies)
 
     # 3. Try key=value cookie pairs (e.g. copied from browser header or text file)
+    header_clean = content_clean
+    if header_clean.lower().startswith("cookie:"):
+        header_clean = header_clean[7:].strip()
+
     kv_cookies = []
-    normalized = content_clean.replace('\r\n', ';').replace('\n', ';')
+    normalized = header_clean.replace('\r\n', ';').replace('\n', ';')
     for item in normalized.split(';'):
         item = item.strip()
         if not item or item.startswith('#'):
             continue
+        if item.lower().startswith("cookie:"):
+            item = item[7:].strip()
         if '=' in item:
             k, v = item.split('=', 1)
             k = k.strip()
@@ -180,7 +236,7 @@ def parse_cookies_content(content: str):
             if k and v:
                 kv_cookies.append({"name": k, "value": v})
     if kv_cookies:
-        return kv_cookies
+        return _finalize_cookies(kv_cookies)
 
     return []
 
@@ -195,7 +251,16 @@ def extract_account_details(stream_obj, device_id_val, install_id_val, priority_
     user_id = ""
     can_go_live = False
     dual_layout_supported = False
-    status_text = "Unknown"
+    status_text = "ready"
+    message_text = ""
+
+    # Check if session cookies exist in session
+    session_names = {"sessionid", "sessionid_ss", "sid_tt", "sid_guard", "multi_sids"}
+    has_session = False
+    if hasattr(stream_obj, "s") and hasattr(stream_obj.s, "cookies"):
+        has_session = any(name in stream_obj.s.cookies for name in session_names)
+
+    signer_error = None
 
     # 1. Try real Stream.getAccountInfo() (the official desktop app method)
     if hasattr(stream_obj, "getAccountInfo"):
@@ -208,19 +273,53 @@ def extract_account_details(stream_obj, device_id_val, install_id_val, priority_
             )
             if isinstance(info, dict):
                 account = info.get("account")
-                if isinstance(account, dict) and (account.get("username") or account.get("screen_name") or account.get("name")):
-                    username = account.get("username") or account.get("screen_name") or account.get("name") or ""
-                    screen_name = account.get("screen_name") or account.get("name") or ""
-                    avatar_url = account.get("avatar_url") or ""
-                    user_id = account.get("user_id_str") or str(account.get("user_id") or "")
-                    can_go_live = bool(info.get("can_go_live", False))
-                    status_text = info.get("status", "ready" if can_go_live else "restricted")
-                    allow_dual = info.get("allow_multi_stream_scene1", False)
-                    dual_layout_supported = bool(allow_dual and info.get("dual_layout_unlocked", False))
+                if isinstance(account, dict):
+                    # Check for session expiration
+                    if account.get("name") == "account_info_error" or account.get("error_code") in (13, 100, 101, 102):
+                        return {
+                            "username": "",
+                            "screen_name": "",
+                            "avatar_url": "",
+                            "user_id": "",
+                            "can_go_live": False,
+                            "dual_layout_supported": False,
+                            "status": "session_expired",
+                            "message": account.get("description") or "TikTok session expired, please sign in again."
+                        }
+
+                    username = (
+                        account.get("username")
+                        or account.get("unique_id")
+                        or account.get("display_id")
+                        or (account.get("screen_name") if account.get("screen_name") != "account_info_error" else "")
+                        or (account.get("name") if account.get("name") != "account_info_error" else "")
+                        or ""
+                    )
+                    screen_name = (
+                        account.get("screen_name")
+                        or account.get("nickname")
+                        or account.get("nick_name")
+                        or account.get("display_name")
+                        or (account.get("name") if account.get("name") != "account_info_error" else "")
+                        or username
+                    )
+                    avatar_url = _extract_avatar(account)
+                    user_id = str(account.get("user_id_str") or account.get("user_id") or "")
+                    if user_id == "0":
+                        user_id = ""
+
+                can_go_live = bool(info.get("can_go_live", False))
+                status_text = info.get("status", "ready" if can_go_live else "restricted")
+                allow_dual = info.get("allow_multi_stream_scene1", False)
+                dual_layout_supported = bool(allow_dual and info.get("dual_layout_unlocked", False))
+        except RuntimeError as re:
+            err_msg = str(re)
+            if "RapidAPI" in err_msg or "signer" in err_msg:
+                signer_error = err_msg
         except Exception:
             pass
 
-    # 2. Fallback to direct passport endpoint if webcast endpoints in getAccountInfo failed
+    # 2. Fallback to direct passport endpoint if webcast endpoints failed or username not resolved
     if not username and hasattr(stream_obj, "_signed_get_json") and hasattr(stream_obj, "s"):
         try:
             verify_fp = f"verify_{device_id_val}" if device_id_val else "verify_0"
@@ -237,12 +336,42 @@ def extract_account_details(stream_obj, device_id_val, install_id_val, priority_
                 priority_region=priority_region,
             )
             account_data = account_payload.get("data", {}) if isinstance(account_payload, dict) else {}
-            if isinstance(account_data, dict) and (account_data.get("username") or account_data.get("screen_name") or account_data.get("name")):
-                username = account_data.get("username") or account_data.get("screen_name") or account_data.get("name") or ""
-                screen_name = account_data.get("screen_name") or account_data.get("name") or ""
-                avatar_url = account_data.get("avatar_url") or ""
-                user_id = account_data.get("user_id_str") or str(account_data.get("user_id") or "")
-                status_text = "ready"
+            if isinstance(account_data, dict):
+                if account_data.get("name") == "account_info_error" or account_data.get("error_code") in (13, 100, 101, 102):
+                    return {
+                        "username": "",
+                        "screen_name": "",
+                        "avatar_url": "",
+                        "user_id": "",
+                        "can_go_live": False,
+                        "dual_layout_supported": False,
+                        "status": "session_expired",
+                        "message": account_data.get("description") or "TikTok session expired, please sign in again."
+                    }
+                username = (
+                    account_data.get("username")
+                    or account_data.get("unique_id")
+                    or account_data.get("display_id")
+                    or (account_data.get("screen_name") if account_data.get("screen_name") != "account_info_error" else "")
+                    or (account_data.get("name") if account_data.get("name") != "account_info_error" else "")
+                    or ""
+                )
+                screen_name = (
+                    account_data.get("screen_name")
+                    or account_data.get("nickname")
+                    or account_data.get("nick_name")
+                    or account_data.get("display_name")
+                    or (account_data.get("name") if account_data.get("name") != "account_info_error" else "")
+                    or username
+                )
+                avatar_url = _extract_avatar(account_data) or avatar_url
+                user_id = str(account_data.get("user_id_str") or account_data.get("user_id") or user_id)
+                if user_id == "0":
+                    user_id = ""
+        except RuntimeError as re:
+            err_msg = str(re)
+            if "RapidAPI" in err_msg or "signer" in err_msg:
+                signer_error = err_msg
         except Exception:
             pass
 
@@ -254,8 +383,14 @@ def extract_account_details(stream_obj, device_id_val, install_id_val, priority_
                 data = room_info.get("data", {}) if isinstance(room_info.get("data"), dict) else {}
                 anchor = data.get("anchor_info") or room_info.get("anchor_info") or {}
                 if isinstance(anchor, dict):
-                    username = anchor.get("nick_name") or anchor.get("nickname") or anchor.get("display_id") or ""
-                    screen_name = anchor.get("nick_name") or anchor.get("nickname") or ""
+                    username = (
+                        anchor.get("nick_name")
+                        or anchor.get("nickname")
+                        or anchor.get("display_id")
+                        or anchor.get("username")
+                        or ""
+                    )
+                    screen_name = anchor.get("nick_name") or anchor.get("nickname") or username
                 if "live_permission" in data or "live_permission" in room_info:
                     can_go_live = bool(data.get("live_permission", room_info.get("live_permission", False)))
                     status_text = "ready" if can_go_live else "restricted"
@@ -264,14 +399,26 @@ def extract_account_details(stream_obj, device_id_val, install_id_val, priority_
         except Exception:
             pass
 
+    if not username and not screen_name:
+        if signer_error:
+            status_text = "signer_error"
+            message_text = signer_error
+        elif not has_session:
+            status_text = "no_cookies"
+            message_text = "No TikTok session cookies found (sessionid is missing)."
+        else:
+            status_text = "unknown"
+            message_text = "Could not resolve TikTok username from cookies."
+
     return {
-        "username": username or "Unknown",
+        "username": username,
         "screen_name": screen_name,
         "avatar_url": avatar_url,
         "user_id": user_id,
         "can_go_live": can_go_live,
         "dual_layout_supported": dual_layout_supported,
-        "status": status_text.lower() if status_text.lower() in ("ready", "restricted", "unknown", "no_cookies") else status_text,
+        "status": status_text.lower() if status_text.lower() in ("ready", "restricted", "unknown", "no_cookies", "session_expired", "signer_error") else status_text,
+        "message": message_text,
     }
 
 def stop_ffmpeg_proxy():
@@ -384,13 +531,14 @@ def account():
         priority_region = cfg.get("priority_region", "")
         details = extract_account_details(stream, device_id, install_id, priority_region=priority_region, topic_id=topic_id)
         return jsonify({
-            "username": details.get("username", "Unknown"),
+            "username": details.get("username", ""),
             "screen_name": details.get("screen_name", ""),
             "avatar_url": details.get("avatar_url", ""),
             "user_id": details.get("user_id", ""),
             "can_go_live": details.get("can_go_live", False),
             "dual_layout_supported": details.get("dual_layout_supported", False),
-            "status": details.get("status", "ready")
+            "status": details.get("status", "ready"),
+            "message": details.get("message", "")
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -680,17 +828,33 @@ def quota():
 def login_cookies():
     global stream
     try:
-        if 'file' not in request.files:
-            return jsonify({"error": "No file uploaded"}), 400
-        file = request.files['file']
-        if file.filename == '':
-            return jsonify({"error": "No file selected"}), 400
+        content = ""
+        if request.is_json:
+            data = request.json or {}
+            content = data.get('cookies') or data.get('content') or ""
+            if not isinstance(content, str):
+                content = json.dumps(content)
+        elif 'file' in request.files:
+            file = request.files['file']
+            if file.filename == '':
+                return jsonify({"error": "No file selected"}), 400
+            raw_bytes = file.read()
+            for enc in ('utf-8-sig', 'utf-16', 'utf-16-le', 'utf-16-be', 'latin-1'):
+                try:
+                    candidate = raw_bytes.decode(enc).strip()
+                    if candidate and parse_cookies_content(candidate):
+                        content = candidate
+                        break
+                except Exception:
+                    continue
+            if not content:
+                content = raw_bytes.decode('utf-8-sig', errors='replace').strip()
+        else:
+            return jsonify({"error": "No file uploaded or cookies payload provided"}), 400
 
-        content = file.read().decode('utf-8-sig', errors='replace').strip()
         parsed_cookies = parse_cookies_content(content)
-
         if not parsed_cookies:
-            return jsonify({"error": "Unable to parse cookies file. Please supply valid JSON or Netscape cookies.txt"}), 400
+            return jsonify({"error": "Unable to parse cookies file. Please supply valid JSON (array or key-value), Netscape cookies.txt, or raw cookie headers."}), 400
 
         target_cookies_path = get_cookies_path()
         try:
@@ -703,14 +867,6 @@ def login_cookies():
             with open(target_cookies_path, 'w', encoding='utf-8') as f:
                 json.dump(parsed_cookies, f, indent=2)
 
-        # Ensure DEFAULT_COOKIES_PATH has a copy if different
-        if os.path.abspath(target_cookies_path) != os.path.abspath(DEFAULT_COOKIES_PATH):
-            try:
-                with open(DEFAULT_COOKIES_PATH, 'w', encoding='utf-8') as f:
-                    json.dump(parsed_cookies, f, indent=2)
-            except Exception:
-                pass
-
         stream = None  # Force re-init with new cookies on next request
 
         details = {
@@ -721,6 +877,7 @@ def login_cookies():
             "can_go_live": False,
             "dual_layout_supported": False,
             "status": "ready",
+            "message": "",
         }
 
         # In testing mode without mocked stream, avoid making real network requests with dummy cookies
@@ -728,14 +885,18 @@ def login_cookies():
         is_mocked = hasattr(Stream, '_mock_return_value') or isinstance(Stream, MagicMock)
         if not is_testing or is_mocked:
             try:
-                ok, _ = init_stream()
+                ok, init_err = init_stream()
                 if ok and stream:
                     cfg = load_config() or {}
                     topic_id = cfg.get("hashtag_id", "5")
                     priority_region = cfg.get("priority_region", "")
                     details = extract_account_details(stream, device_id, install_id, priority_region=priority_region, topic_id=topic_id)
-            except Exception:
-                pass
+                elif init_err:
+                    details["status"] = "error"
+                    details["message"] = init_err
+            except Exception as e:
+                details["status"] = "error"
+                details["message"] = str(e)
 
         # Re-save exact parsed_cookies to target_cookies_path so any network side-effects during probing
         # do not alter the saved cookie count/content
@@ -745,20 +906,26 @@ def login_cookies():
         except Exception:
             pass
 
-        username_val = details.get("username", "")
-        if username_val == "Unknown":
-            username_val = ""
+        status_val = details.get("status", "ready")
+        message_val = details.get("message", "")
+        if status_val == "session_expired":
+            message_val = message_val or "TikTok session expired. Please sign in to TikTok and export fresh cookies."
+        elif status_val == "no_cookies":
+            message_val = message_val or "No session cookies found. Please make sure sessionid is included."
+        elif not message_val:
+            message_val = f"Successfully loaded {len(parsed_cookies)} cookies"
 
         return jsonify({
-            "success": True,
-            "username": username_val,
+            "success": status_val not in ("session_expired", "no_cookies", "error"),
+            "username": details.get("username", ""),
             "screen_name": details.get("screen_name", ""),
             "avatar_url": details.get("avatar_url", ""),
             "user_id": details.get("user_id", ""),
             "can_go_live": details.get("can_go_live", False),
             "dual_layout_supported": details.get("dual_layout_supported", False),
-            "status": details.get("status", "ready"),
-            "message": f"Successfully loaded {len(parsed_cookies)} cookies"
+            "status": status_val,
+            "message": message_val,
+            "cookie_count": len(parsed_cookies)
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500

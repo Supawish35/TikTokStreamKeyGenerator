@@ -1781,35 +1781,46 @@ class Stream:
                 "live_studio": "1",
             }
         )
-        create_info = self._signed_get_json(
-            base_url + "webcast/room/create_info/",
-            params=create_params,
-            priority_region=priority_region,
-        )
+        create_data = {}
+        try:
+            create_info = self._signed_get_json(
+                base_url + "webcast/room/create_info/",
+                params=create_params,
+                priority_region=priority_region,
+            )
+            create_data = create_info.get("data", {}) if isinstance(create_info, dict) else {}
+        except Exception:
+            create_data = {}
 
-        game_params = dict(common_params)
-        game_params["scene"] = "2"
-        game_create_info = self._signed_get_json(
-            base_url + "webcast/game/basic/create_info/",
-            params=game_params,
-            priority_region=priority_region,
-        )
+        game_data = {}
+        try:
+            game_params = dict(common_params)
+            game_params["scene"] = "2"
+            game_create_info = self._signed_get_json(
+                base_url + "webcast/game/basic/create_info/",
+                params=game_params,
+                priority_region=priority_region,
+            )
+            game_data = game_create_info.get("data", {}) if isinstance(game_create_info, dict) else {}
+        except Exception:
+            game_data = {}
 
         # Scene=1 is what TikTok LIVE Studio queries to decide whether the
         # dual layout button is shown at all; verified against Charles
         # captures: accounts with dual access return allow_multi_stream=true
         # here, accounts without return false.
-        dual_params = dict(common_params)
-        dual_params["scene"] = "1"
-        dual_create_info = self._signed_get_json(
-            base_url + "webcast/game/basic/create_info/",
-            params=dual_params,
-            priority_region=priority_region,
-        )
-
-        create_data = create_info.get("data", {}) if isinstance(create_info, dict) else {}
-        game_data = game_create_info.get("data", {}) if isinstance(game_create_info, dict) else {}
-        dual_data = dual_create_info.get("data", {}) if isinstance(dual_create_info, dict) else {}
+        dual_data = {}
+        try:
+            dual_params = dict(common_params)
+            dual_params["scene"] = "1"
+            dual_create_info = self._signed_get_json(
+                base_url + "webcast/game/basic/create_info/",
+                params=dual_params,
+                priority_region=priority_region,
+            )
+            dual_data = dual_create_info.get("data", {}) if isinstance(dual_create_info, dict) else {}
+        except Exception:
+            dual_data = {}
 
         # New-user sensitive-feature restriction: dual layout stays locked
         # until the account has gone LIVE enough 25-minute sessions.

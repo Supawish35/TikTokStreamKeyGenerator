@@ -11,6 +11,8 @@ export default function AccountPanel({ quotaData }) {
     const [uploading, setUploading] = useState(false);
     const [savingKey, setSavingKey] = useState(false);
     const [dragOver, setDragOver] = useState(false);
+    const [showPaste, setShowPaste] = useState(false);
+    const [pasteText, setPasteText] = useState('');
     const showToast = useToast();
 
     const fetchAccount = async () => {
@@ -46,24 +48,33 @@ export default function AccountPanel({ quotaData }) {
 
     const quota = quotaData || localQuota;
 
-    const handleUploadFile = async (file) => {
-        if (!file) return;
+    const handleUploadFile = async (fileOrContent) => {
+        if (!fileOrContent) return;
         setUploading(true);
         try {
-            const res = await uploadCookies(file);
-            showToast(res.message || 'Cookies uploaded successfully!', 'success');
-            if (res.username) {
-                setAccountInfo(prev => ({
-                    ...prev,
-                    username: res.username,
-                    screen_name: res.screen_name,
-                    avatar_url: res.avatar_url,
-                    can_go_live: res.can_go_live,
-                    dual_layout_supported: res.dual_layout_supported,
-                    status: res.status
-                }));
+            const res = await uploadCookies(fileOrContent);
+            if (res.status === 'session_expired') {
+                showToast(res.message || 'TikTok session expired. Please re-login and export fresh cookies.', 'warning');
+            } else if (res.status === 'signer_error') {
+                showToast(res.message || 'RapidAPI key error during account check.', 'warning');
+            } else if (res.username || res.screen_name) {
+                const displayName = res.username ? (res.username.startsWith('@') ? res.username : `@${res.username}`) : res.screen_name;
+                showToast(`Logged in as ${displayName}!`, 'success');
+            } else {
+                showToast(res.message || 'Cookies uploaded successfully!', 'success');
             }
-            await fetchAccount();
+            setAccountInfo({
+                username: res.username || '',
+                screen_name: res.screen_name || '',
+                avatar_url: res.avatar_url || '',
+                user_id: res.user_id || '',
+                can_go_live: Boolean(res.can_go_live),
+                dual_layout_supported: Boolean(res.dual_layout_supported),
+                status: res.status || 'ready',
+                message: res.message || ''
+            });
+            if (showPaste) setShowPaste(false);
+            setPasteText('');
         } catch (err) {
             showToast(err.message || 'Failed to upload cookies', 'error');
         } finally {
@@ -129,9 +140,13 @@ export default function AccountPanel({ quotaData }) {
                             )}
                             <div className="min-w-0 flex-1">
                                 <span className="text-sm font-bold text-white truncate block" title={accountInfo?.username || 'Not logged in'}>
-                                    {loadingAccount ? 'Loading...' : (accountInfo?.username || accountInfo?.screen_name || 'Not logged in')}
+                                    {loadingAccount ? 'Loading...' : (
+                                        accountInfo?.username && accountInfo.username !== 'Unknown'
+                                            ? (accountInfo.username.startsWith('@') ? accountInfo.username : `@${accountInfo.username}`)
+                                            : (accountInfo?.screen_name || (accountInfo?.status === 'session_expired' ? 'Session Expired' : (accountInfo?.status === 'no_cookies' ? 'Not logged in' : 'Unknown')))
+                                    )}
                                 </span>
-                                {accountInfo?.screen_name && accountInfo.screen_name !== accountInfo.username && (
+                                {accountInfo?.screen_name && accountInfo.screen_name !== accountInfo.username && accountInfo.username !== 'Unknown' && (
                                     <span className="text-[11px] text-[#8a8a8a] truncate block" title={accountInfo.screen_name}>
                                         {accountInfo.screen_name}
                                     </span>
@@ -158,19 +173,69 @@ export default function AccountPanel({ quotaData }) {
 
                     <div className="bg-[#151515] p-3 rounded-lg border border-[#2a2a2a]">
                         <span className="block text-[11px] text-[#8a8a8a] uppercase tracking-wider mb-1">Status</span>
-                        <span className="text-xs font-semibold text-[#25f4ee] capitalize">
-                            {accountInfo?.status || 'Unknown'}
+                        <span className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold capitalize ${
+                            accountInfo?.status === 'ready'
+                                ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30'
+                                : accountInfo?.status === 'session_expired'
+                                ? 'bg-amber-500/15 text-amber-400 border border-amber-500/30'
+                                : accountInfo?.status === 'signer_error'
+                                ? 'bg-[#fe2c55]/15 text-[#fe2c55] border border-[#fe2c55]/30'
+                                : 'bg-[#25f4ee]/15 text-[#25f4ee] border border-[#25f4ee]/30'
+                        }`}>
+                            {accountInfo?.status ? accountInfo.status.replace('_', ' ') : 'Unknown'}
                         </span>
                     </div>
                 </div>
+
+                {/* Expiration or Signer Alert Banner */}
+                {accountInfo?.status === 'session_expired' && (
+                    <div className="p-3 bg-amber-500/10 border border-amber-500/30 rounded-lg flex items-start gap-2.5 text-xs text-amber-300">
+                        <svg className="w-4 h-4 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                        </svg>
+                        <div>
+                            <span className="font-semibold block">TikTok Session Expired</span>
+                            <span>{accountInfo.message || 'The cookies you provided are expired or invalid. Please sign into TikTok in your browser, export fresh cookies, and upload them here.'}</span>
+                        </div>
+                    </div>
+                )}
+                {accountInfo?.status === 'signer_error' && (
+                    <div className="p-3 bg-red-500/10 border border-red-500/30 rounded-lg flex items-start gap-2.5 text-xs text-red-300">
+                        <svg className="w-4 h-4 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                        </svg>
+                        <div>
+                            <span className="font-semibold block">RapidAPI Key Required</span>
+                            <span>{accountInfo.message || 'A valid RapidAPI key is required to sign TikTok live requests. Please configure your key below.'}</span>
+                        </div>
+                    </div>
+                )}
             </div>
 
-            {/* Cookies Upload Zone */}
+            {/* Cookies Upload / Paste Zone */}
             <div className="space-y-2">
                 <div className="flex items-center justify-between">
-                    <span className="text-xs font-semibold uppercase tracking-wider text-[#8a8a8a]">
-                        TikTok Cookies
-                    </span>
+                    <div className="flex items-center gap-3">
+                        <span className="text-xs font-semibold uppercase tracking-wider text-[#8a8a8a]">
+                            TikTok Cookies
+                        </span>
+                        <div className="flex rounded bg-[#202020] p-0.5 text-[11px]">
+                            <button
+                                type="button"
+                                onClick={() => setShowPaste(false)}
+                                className={`px-2 py-0.5 rounded font-medium transition-colors ${!showPaste ? 'bg-[#2a2a2a] text-[#25f4ee]' : 'text-[#8a8a8a] hover:text-white'}`}
+                            >
+                                File Upload
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => setShowPaste(true)}
+                                className={`px-2 py-0.5 rounded font-medium transition-colors ${showPaste ? 'bg-[#2a2a2a] text-[#25f4ee]' : 'text-[#8a8a8a] hover:text-white'}`}
+                            >
+                                Paste Text
+                            </button>
+                        </div>
+                    </div>
                     <a
                         href="https://chromewebstore.google.com/detail/editthiscookie/fngmhnnpilhplaeedifhccceomclgfbg"
                         target="_blank"
@@ -184,35 +249,64 @@ export default function AccountPanel({ quotaData }) {
                     </a>
                 </div>
 
-                <label
-                    onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
-                    onDragLeave={() => setDragOver(false)}
-                    onDrop={handleDrop}
-                    className={`border-2 border-dashed rounded-xl p-5 flex flex-col items-center justify-center text-center cursor-pointer transition-all ${
-                        dragOver
-                            ? 'border-[#25f4ee] bg-[#25f4ee]/10 scale-[1.01]'
-                            : 'border-[#333] hover:border-[#25f4ee]/70 bg-[#161616]'
-                    }`}
-                >
-                    <div className="w-10 h-10 rounded-full bg-[#25f4ee]/10 text-[#25f4ee] flex items-center justify-center mb-2">
-                        <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                        </svg>
+                {!showPaste ? (
+                    <label
+                        onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+                        onDragLeave={() => setDragOver(false)}
+                        onDrop={handleDrop}
+                        className={`border-2 border-dashed rounded-xl p-5 flex flex-col items-center justify-center text-center cursor-pointer transition-all ${
+                            dragOver
+                                ? 'border-[#25f4ee] bg-[#25f4ee]/10 scale-[1.01]'
+                                : 'border-[#333] hover:border-[#25f4ee]/70 bg-[#161616]'
+                        }`}
+                    >
+                        <div className="w-10 h-10 rounded-full bg-[#25f4ee]/10 text-[#25f4ee] flex items-center justify-center mb-2">
+                            <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                            </svg>
+                        </div>
+                        <span className="text-sm font-semibold text-white mb-1">
+                            {uploading ? 'Processing cookies...' : 'Drop your cookies.json here or click to browse'}
+                        </span>
+                        <span className="text-xs text-[#8a8a8a]">
+                            Accepts JSON array, key-value dict, or Netscape cookies.txt
+                        </span>
+                        <input
+                            type="file"
+                            accept=".json,.txt"
+                            disabled={uploading}
+                            onChange={handleFileChange}
+                            className="hidden"
+                        />
+                    </label>
+                ) : (
+                    <div className="space-y-2 bg-[#161616] p-4 rounded-xl border border-[#2a2a2a]">
+                        <textarea
+                            rows={4}
+                            value={pasteText}
+                            onChange={(e) => setPasteText(e.target.value)}
+                            placeholder="Paste your JSON cookies array, key-value JSON, or Cookie: sessionid=... header string here"
+                            className="w-full bg-[#202020] border border-[#333] rounded-lg p-2.5 text-xs text-white font-mono focus:outline-none focus:border-[#25f4ee] transition-all resize-y"
+                        />
+                        <div className="flex justify-end gap-2">
+                            <button
+                                type="button"
+                                onClick={() => { setPasteText(''); setShowPaste(false); }}
+                                className="px-3 py-1.5 text-xs text-[#8a8a8a] hover:text-white rounded transition-colors"
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                type="button"
+                                disabled={uploading || !pasteText.trim()}
+                                onClick={() => handleUploadFile(pasteText.trim())}
+                                className="px-4 py-1.5 bg-[#25f4ee] hover:bg-[#25f4ee]/90 text-black font-semibold text-xs rounded transition-colors disabled:opacity-50"
+                            >
+                                {uploading ? 'Processing...' : 'Import Cookies'}
+                            </button>
+                        </div>
                     </div>
-                    <span className="text-sm font-semibold text-white mb-1">
-                        {uploading ? 'Processing cookies...' : 'Drop your cookies.json here or click to browse'}
-                    </span>
-                    <span className="text-xs text-[#8a8a8a]">
-                        Accepts JSON array or Netscape cookies.txt format
-                    </span>
-                    <input
-                        type="file"
-                        accept=".json,.txt"
-                        disabled={uploading}
-                        onChange={handleFileChange}
-                        className="hidden"
-                    />
-                </label>
+                )}
             </div>
 
             {/* RapidAPI Key Input & Quota */}
