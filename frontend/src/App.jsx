@@ -10,6 +10,7 @@ import Controls from './components/Controls';
 import StreamOutput from './components/StreamOutput';
 import RealtimeStats from './components/RealtimeStats';
 import AudienceSafety from './components/AudienceSafety';
+import LinkMicPanel from './components/LinkMicPanel';
 
 function MainContent() {
     const [streamInfo, setStreamInfo] = useState({
@@ -41,7 +42,8 @@ function MainContent() {
         account: true,
         controlsOutput: true,
         stats: false,
-        audience: false
+        audience: false,
+        linkmic: false
     });
 
     const showToast = useToast();
@@ -52,6 +54,8 @@ function MainContent() {
         showToast(`⚠️ New violation: ${reason}`, 'violation', 10000);
     }, [showToast]);
 
+    const [linkMicStatus, setLinkMicStatus] = useState(null);
+
     // Connect to SSE stream
     const {
         isConnected,
@@ -59,10 +63,15 @@ function MainContent() {
         stats: sseStats,
         audience: sseAudience,
         safety: sseSafety,
-        quota: sseQuota
+        quota: sseQuota,
+        linkmic: sseLinkMic
     } = useSSE('/api/events', {
         onViolationAlert: handleViolationAlert
     });
+
+    useEffect(() => {
+        if (sseLinkMic) setLinkMicStatus(sseLinkMic);
+    }, [sseLinkMic]);
 
     // Sync SSE status updates into local streamInfo state
     useEffect(() => {
@@ -207,6 +216,25 @@ function MainContent() {
                 }
             >
                 <RealtimeStats statsData={sseStats} isLive={isLive} />
+            </CollapsibleCard>
+
+            {/* LinkMic status and supported host controls */}
+            <CollapsibleCard
+                title="LinkMic Host Controls"
+                isOpen={openCards.linkmic}
+                onToggle={() => toggleCard('linkmic')}
+                badge={<span className="bg-[#252525] text-[#8a8a8a]">Status</span>}
+                icon={
+                    <svg className="w-5 h-5 text-[#25f4ee]" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M17 20h5v-2a3 3 0 00-5.830-1M17 20H7m10 0v-2c0-.653-.126-1.277-.354-1.854M7 20H2v-2a3 3 0 015.830-1M7 20v-2c0-.653.126-1.277.354-1.854m0 0a5.002 5.002 0 019.292 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z" />
+                    </svg>
+                }
+            >
+                <LinkMicPanel
+                    status={linkMicStatus ?? sseLinkMic}
+                    onStatusChange={setLinkMicStatus}
+                    isLive={isLive}
+                />
             </CollapsibleCard>
 
             {/* Card 5: Audience & Safety */}

@@ -29,6 +29,7 @@ export const resumeLive = () => request(`${API}/resume`, { method: 'POST' });
 export const getStatus = () => request(`${API}/status`);
 export const getStats = () => request(`${API}/stats`);
 export const getAudience = () => request(`${API}/audience`);
+export const getLinkMicStatus = () => request(`${API}/linkmic/status`);
 export const getViolations = () => request(`${API}/violations`);
 export const getQuota = () => request(`${API}/quota`);
 export const uploadCookies = (fileOrContent) => {
@@ -57,6 +58,7 @@ export const api = {
     getStatus,
     getStats,
     getAudience,
+    getLinkMicStatus,
     getViolations,
     getQuota,
     uploadCookies,

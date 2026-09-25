@@ -7,6 +7,7 @@ export function useSSE(url = '/api/events', options = {}) {
     const [audience, setAudience] = useState(null);
     const [safety, setSafety] = useState(null);
     const [quota, setQuota] = useState(null);
+    const [linkmic, setLinkmic] = useState(null);
 
     useEffect(() => {
         const es = new EventSource(url);
@@ -17,6 +18,7 @@ export function useSSE(url = '/api/events', options = {}) {
         es.addEventListener('audience', (e) => { try { setAudience(JSON.parse(e.data)); } catch (_) {} });
         es.addEventListener('safety', (e) => { try { setSafety(JSON.parse(e.data)); } catch (_) {} });
         es.addEventListener('quota', (e) => { try { setQuota(JSON.parse(e.data)); } catch (_) {} });
+        es.addEventListener('linkmic_update', (e) => { try { setLinkmic(JSON.parse(e.data)); } catch (_) {} });
         es.addEventListener('heartbeat', () => setIsConnected(true));
         es.addEventListener('violation_alert', (e) => {
             try {
@@ -27,5 +29,5 @@ export function useSSE(url = '/api/events', options = {}) {
         return () => es.close();
     }, [url, options.onViolationAlert]);
 
-    return { isConnected, status, stats, audience, safety, quota };
+    return { isConnected, status, stats, audience, safety, quota, linkmic };
 }

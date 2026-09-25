@@ -1028,6 +1028,18 @@ class Stream:
             return None
         return info.get("room")
 
+    def getLinkMicStatus(self, device_id="", install_id="", priority_region=""):
+        """Return the LinkMic count already exposed by the room/continue response."""
+        info = self.getContinuableStreamInfo(
+            device_id=device_id,
+            install_id=install_id,
+            priority_region=priority_region,
+        )
+        return {
+            "guest_count": info.get("link_mic_user_num") if info.get("has_room") else None,
+            "available": bool(info.get("has_room")),
+        }
+
     def _pingAnchorStatus(
         self,
         status,

@@ -862,6 +862,24 @@ def audience():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+def _linkmic_status():
+    if not is_live or not stream:
+        return {"is_live": False, "guest_count": None, "available": False}
+    cfg = load_config() or {}
+    result = stream.getLinkMicStatus(
+        device_id=device_id,
+        install_id=install_id,
+        priority_region=cfg.get("priority_region", ""),
+    ) or {}
+    return {"is_live": True, **result}
+
+@app.route('/api/linkmic/status', methods=['GET'])
+def linkmic_status():
+    try:
+        return jsonify(_linkmic_status())
+    except Exception:
+        return jsonify({"error": "Unable to fetch LinkMic status."}), 502
+
 @app.route('/api/violations', methods=['GET'])
 def violations():
     try:
@@ -1074,6 +1092,11 @@ def events():
 
                     # 4. Audience and Safety events every 15s when live
                     if tick % 15 == 0:
+                        try:
+                            yield f"event: linkmic_update\ndata: {json.dumps(_linkmic_status())}\n\n"
+                        except Exception:
+                            pass
+
                         try:
                             aud = stream.getOnlineAudience(device_id=device_id, install_id=install_id, room_id=room_id)
                             yield f"event: audience\ndata: {json.dumps(aud or {})}\n\n"
