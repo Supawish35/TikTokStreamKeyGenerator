@@ -469,8 +469,30 @@ class Stream:
             cookies_file = json.load(file)
 
         cookies = {}
-        for cookie in cookies_file:
-            cookies[cookie["name"]] = cookie["value"]
+        if isinstance(cookies_file, dict):
+            if isinstance(cookies_file.get("cookies"), list):
+                cookies_file = cookies_file["cookies"]
+            elif isinstance(cookies_file.get("Cookie"), list):
+                cookies_file = cookies_file["Cookie"]
+            else:
+                for k, v in cookies_file.items():
+                    if isinstance(v, (str, int, float, bool)):
+                        cookies[str(k).strip()] = str(v).strip()
+        if isinstance(cookies_file, list):
+            for cookie in cookies_file:
+                if isinstance(cookie, dict):
+                    name = cookie.get("name") or cookie.get("key")
+                    val = cookie.get("value")
+                    if val is None and "val" in cookie:
+                        val = cookie.get("val")
+                    if name is not None and val is not None:
+                        cookies[str(name).strip()] = str(val).strip()
+
+        if cookies.get("sessionid") and not cookies.get("sessionid_ss"):
+            cookies["sessionid_ss"] = cookies["sessionid"]
+        elif cookies.get("sessionid_ss") and not cookies.get("sessionid"):
+            cookies["sessionid"] = cookies["sessionid_ss"]
+
         self.s.cookies.update(cookies)
 
     def __enter__(self):
@@ -1762,12 +1784,31 @@ class Stream:
                 "verifyFp": verify_fp,
             }
         )
-        account_payload = self._signed_get_json(
-            build_endpoint("api.tiktokv.com", "passport/account/info/v2/", self.s),
-            params=account_params,
-            priority_region=priority_region,
-        )
-        account_data = account_payload.get("data", {}) if isinstance(account_payload, dict) else {}
+        account_data = {}
+        passport_endpoint = build_endpoint("api.tiktokv.com", "passport/account/info/v2/", self.s)
+        try:
+            account_payload = self._signed_get_json(
+                passport_endpoint,
+                params=account_params,
+                priority_region=priority_region,
+            )
+            account_data = account_payload.get("data", {}) if isinstance(account_payload, dict) else {}
+        except Exception as exc:
+            # Fallback to direct GET using session cookies if signing service fails
+            try:
+                raw_resp = self.s.get(
+                    passport_endpoint,
+                    params=account_params,
+                    timeout=10,
+                )
+                if raw_resp.status_code == 200:
+                    raw_data = raw_resp.json()
+                    if isinstance(raw_data, dict):
+                        account_data = raw_data.get("data", {}) or {}
+            except Exception:
+                pass
+            if not account_data:
+                raise exc
         common_params = self._studio_params(
             device_id=device_id,
             install_id=install_id,

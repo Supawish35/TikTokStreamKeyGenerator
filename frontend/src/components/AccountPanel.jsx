@@ -57,6 +57,10 @@ export default function AccountPanel({ quotaData }) {
                 showToast(res.message || 'TikTok session expired. Please re-login and export fresh cookies.', 'warning');
             } else if (res.status === 'signer_error') {
                 showToast(res.message || 'RapidAPI key error during account check.', 'warning');
+            } else if (res.status === 'no_cookies') {
+                showToast(res.message || 'No session cookies found. Please make sure sessionid is included.', 'warning');
+            } else if (res.status === 'error') {
+                showToast(res.message || 'Error processing cookies.', 'error');
             } else if (res.username || res.screen_name) {
                 const displayName = res.username ? (res.username.startsWith('@') ? res.username : `@${res.username}`) : res.screen_name;
                 showToast(`Logged in as ${displayName}!`, 'success');
@@ -99,6 +103,8 @@ export default function AccountPanel({ quotaData }) {
         try {
             await saveConfig({ rapidapi_key: rapidApiKey });
             showToast('RapidAPI key saved to config.json', 'success');
+            await fetchQuota();
+            await fetchAccount();
         } catch (err) {
             showToast('Failed to save RapidAPI key: ' + err.message, 'error');
         } finally {
@@ -143,7 +149,11 @@ export default function AccountPanel({ quotaData }) {
                                     {loadingAccount ? 'Loading...' : (
                                         accountInfo?.username && accountInfo.username !== 'Unknown'
                                             ? (accountInfo.username.startsWith('@') ? accountInfo.username : `@${accountInfo.username}`)
-                                            : (accountInfo?.screen_name || (accountInfo?.status === 'session_expired' ? 'Session Expired' : (accountInfo?.status === 'no_cookies' ? 'Not logged in' : 'Unknown')))
+                                            : (accountInfo?.screen_name || (
+                                                accountInfo?.status === 'session_expired' ? 'Session Expired' :
+                                                accountInfo?.status === 'signer_error' ? 'Signer Error' :
+                                                accountInfo?.status === 'no_cookies' ? 'Not logged in' : 'Unknown'
+                                            ))
                                     )}
                                 </span>
                                 {accountInfo?.screen_name && accountInfo.screen_name !== accountInfo.username && accountInfo.username !== 'Unknown' && (
@@ -180,9 +190,11 @@ export default function AccountPanel({ quotaData }) {
                                 ? 'bg-amber-500/15 text-amber-400 border border-amber-500/30'
                                 : accountInfo?.status === 'signer_error'
                                 ? 'bg-[#fe2c55]/15 text-[#fe2c55] border border-[#fe2c55]/30'
+                                : accountInfo?.status === 'no_cookies'
+                                ? 'bg-[#8a8a8a]/15 text-[#8a8a8a] border border-[#8a8a8a]/30'
                                 : 'bg-[#25f4ee]/15 text-[#25f4ee] border border-[#25f4ee]/30'
                         }`}>
-                            {accountInfo?.status ? accountInfo.status.replace('_', ' ') : 'Unknown'}
+                            {accountInfo?.status === 'session_expired' ? 'Expired' : (accountInfo?.status === 'signer_error' ? 'Signer Error' : (accountInfo?.status ? accountInfo.status.replace('_', ' ') : 'Unknown'))}
                         </span>
                     </div>
                 </div>
@@ -207,6 +219,17 @@ export default function AccountPanel({ quotaData }) {
                         <div>
                             <span className="font-semibold block">RapidAPI Key Required</span>
                             <span>{accountInfo.message || 'A valid RapidAPI key is required to sign TikTok live requests. Please configure your key below.'}</span>
+                        </div>
+                    </div>
+                )}
+                {accountInfo?.status === 'no_cookies' && accountInfo?.message && (
+                    <div className="p-3 bg-amber-500/10 border border-amber-500/30 rounded-lg flex items-start gap-2.5 text-xs text-amber-300">
+                        <svg className="w-4 h-4 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                        </svg>
+                        <div>
+                            <span className="font-semibold block">Missing Session Cookies</span>
+                            <span>{accountInfo.message}</span>
                         </div>
                     </div>
                 )}
@@ -285,7 +308,7 @@ export default function AccountPanel({ quotaData }) {
                             rows={4}
                             value={pasteText}
                             onChange={(e) => setPasteText(e.target.value)}
-                            placeholder="Paste your JSON cookies array, key-value JSON, or Cookie: sessionid=... header string here"
+                            placeholder="Paste your JSON cookies array, key-value JSON, Netscape cookies.txt, Cookie: header, or cURL command here"
                             className="w-full bg-[#202020] border border-[#333] rounded-lg p-2.5 text-xs text-white font-mono focus:outline-none focus:border-[#25f4ee] transition-all resize-y"
                         />
                         <div className="flex justify-end gap-2">

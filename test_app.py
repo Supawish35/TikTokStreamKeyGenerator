@@ -432,6 +432,119 @@ class TestApp(unittest.TestCase):
             self.assertTrue(res.get_json()["success"])
             self.assertEqual(res.get_json()["username"], "pasted_user")
 
+    def test_cookie_upload_curl_command(self):
+        """Verify pasting a cURL command parses sessionid cleanly without corrupted keys."""
+        mock_stream = MagicMock()
+        mock_stream.getAccountInfo.return_value = {
+            "account": {"username": "curl_user", "screen_name": "Curl User"},
+            "can_go_live": True,
+            "status": "Ready"
+        }
+        with patch('app.Stream', return_value=mock_stream):
+            curl_cmd = (
+                "curl 'https://www.tiktok.com/' \\\n"
+                "  -H 'accept: text/html' \\\n"
+                "  -H 'cookie: sessionid=curl_sess_val; ttwid=curl_ttwid_val' \\\n"
+                "  --compressed"
+            )
+            res = self.client.post('/api/login/cookies', json={"cookies": curl_cmd})
+            self.assertEqual(res.status_code, 200)
+            self.assertTrue(res.get_json()["success"])
+            self.assertEqual(res.get_json()["username"], "curl_user")
+
+            cookies_file = flask_app.get_cookies_path()
+            with open(cookies_file, encoding='utf-8') as f:
+                saved = json.load(f)
+            names = [c["name"] for c in saved]
+            self.assertIn("sessionid", names)
+            self.assertIn("ttwid", names)
+            # Ensure no garbage headers got parsed as cookies
+            self.assertNotIn("accept", names)
+
+    def test_cookie_upload_set_cookie_header(self):
+        """Verify Set-Cookie headers ignore attributes like Path and Domain."""
+        mock_stream = MagicMock()
+        mock_stream.getAccountInfo.return_value = {
+            "account": {"username": "set_user", "screen_name": "Set User"},
+            "can_go_live": True,
+            "status": "Ready"
+        }
+        with patch('app.Stream', return_value=mock_stream):
+            raw = (
+                "Set-Cookie: sessionid=sess_set_cookie; Path=/; Domain=.tiktok.com; Secure; HttpOnly\r\n"
+                "Set-Cookie: ttwid=ttwid_set_cookie; Path=/"
+            )
+            res = self.client.post('/api/login/cookies', json={"cookies": raw})
+            self.assertEqual(res.status_code, 200)
+            self.assertTrue(res.get_json()["success"])
+            self.assertEqual(res.get_json()["username"], "set_user")
+
+            cookies_file = flask_app.get_cookies_path()
+            with open(cookies_file, encoding='utf-8') as f:
+                saved = json.load(f)
+            names = [c["name"] for c in saved]
+            self.assertIn("sessionid", names)
+            self.assertNotIn("Path", names)
+            self.assertNotIn("Domain", names)
+            self.assertNotIn("HttpOnly", names)
+
+    def test_init_stream_mirrors_sessionid_ss_in_memory(self):
+        """Verify that initializing stream with only sessionid mirrors sessionid_ss in memory."""
+        with open(flask_app.get_cookies_path(), "w", encoding='utf-8') as f:
+            json.dump([{"name": "sessionid", "value": "single_token_abc"}], f)
+
+        flask_app.stream = None
+        ok, err = flask_app.init_stream()
+        self.assertTrue(ok)
+        self.assertIsNotNone(flask_app.stream)
+        self.assertEqual(flask_app.stream.s.cookies.get("sessionid"), "single_token_abc")
+        self.assertEqual(flask_app.stream.s.cookies.get("sessionid_ss"), "single_token_abc")
+
+    def test_stream_init_with_dict_cookies_on_disk(self):
+        """Verify Stream initializes cleanly when cookies.json on disk is a dict."""
+        from TiktokStreamKeyGenerator import Stream
+        dict_cookies_path = os.path.join(self.tmp_dir, "dict_cookies.json")
+        with open(dict_cookies_path, "w", encoding="utf-8") as f:
+            json.dump({"sessionid": "dict_token_123"}, f)
+
+        stream = Stream(cookies_path=dict_cookies_path)
+        self.assertEqual(stream.s.cookies.get("sessionid"), "dict_token_123")
+        self.assertEqual(stream.s.cookies.get("sessionid_ss"), "dict_token_123")
+
+    def test_account_with_signer_error_status(self):
+        """Verify that RapidAPI signature failure surfaces as signer_error status."""
+        with open(flask_app.get_cookies_path(), "w", encoding='utf-8') as f:
+            json.dump([{"name": "sessionid", "value": "test_val"}], f)
+
+        mock_stream = MagicMock()
+        mock_stream.getAccountInfo.side_effect = RuntimeError("signature API failed: RapidAPI signer HTTP 403: Forbidden")
+
+        with patch('app.Stream', return_value=mock_stream):
+            flask_app.stream = None
+            res = self.client.get('/api/account')
+            self.assertEqual(res.status_code, 200)
+            acc = res.get_json()
+            self.assertEqual(acc["username"], "")
+            self.assertEqual(acc["status"], "signer_error")
+            self.assertIn("RapidAPI", acc["message"])
+
+    def test_cookie_upload_missing_sessionid_warns(self):
+        """Verify uploading cookies without sessionid returns success=False and no_cookies status."""
+        res = self.client.post('/api/login/cookies', json={"cookies": "tt_csrf_token=csrf_only_val"})
+        self.assertEqual(res.status_code, 200)
+        data = res.get_json()
+        self.assertFalse(data["success"])
+        self.assertEqual(data["status"], "no_cookies")
+        self.assertIn("sessionid", data["message"].lower())
+
+    def test_save_rapidapi_key_resets_stream(self):
+        """Verify saving rapidapi_key in config resets stream and sets env variable."""
+        flask_app.stream = MagicMock()
+        res = self.client.post('/api/config', json={"rapidapi_key": "new_rapidapi_key_test"})
+        self.assertEqual(res.status_code, 200)
+        self.assertIsNone(flask_app.stream)
+        self.assertEqual(os.environ.get("RAPIDAPI_KEY"), "new_rapidapi_key_test")
+
 if __name__ == '__main__':
     unittest.main()
 

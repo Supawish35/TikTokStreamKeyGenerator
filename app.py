@@ -6,7 +6,13 @@ import threading
 import subprocess
 import signal
 import atexit
+import re
 from unittest.mock import MagicMock
+
+COOKIE_ATTRIBUTES = {
+    "path", "domain", "expires", "max-age", "samesite", "secure",
+    "httponly", "priority", "comment", "version"
+}
 
 # Ensure zero PySide6 imports / GUI dependencies in web runtime
 for mod in ["PySide6", "PySide6.QtCore", "PySide6.QtGui", "PySide6.QtWidgets"]:
@@ -128,25 +134,32 @@ def _extract_avatar(data):
 
 def _finalize_cookies(cookies):
     """
-    Deduplicates cookies preserving the last occurrence of each cookie name.
+    Deduplicates cookies preserving the best occurrence of each cookie name.
+    Prioritizes cookies associated with TikTok domains over foreign domains.
     """
     seen = {}
     for c in cookies:
         name = c.get("name")
-        if name:
-            seen[name] = c
+        if not name:
+            continue
+        if name in seen:
+            old_domain = str(seen[name].get("domain") or "").lower()
+            new_domain = str(c.get("domain") or "").lower()
+            if "tiktok" in old_domain and "tiktok" not in new_domain:
+                continue
+        seen[name] = c
     return list(seen.values())
 
 def parse_cookies_content(content: str):
     """
-    Parses cookies from JSON (list, wrapper dict, key-value dict), Netscape format, or raw header string.
+    Parses cookies from JSON (list, wrapper dict, key-value dict), Netscape format,
+    cURL commands, Set-Cookie headers, or raw Cookie headers.
     Returns a list of dicts each with at least 'name' and 'value'.
     """
     if not content:
         return []
 
     content_clean = content.strip()
-    parsed = []
 
     # 1. Try JSON parsing
     try:
@@ -159,6 +172,13 @@ def parse_cookies_content(content: str):
                 data = data["Cookie"]
             elif isinstance(data.get("data"), dict) and isinstance(data["data"].get("cookies"), list):
                 data = data["data"]["cookies"]
+            elif isinstance(data.get("cookies"), str):
+                try:
+                    nested = json.loads(data["cookies"])
+                    if isinstance(nested, list):
+                        data = nested
+                except Exception:
+                    pass
             elif "name" in data and "value" in data:
                 data = [data]
             else:
@@ -172,10 +192,13 @@ def parse_cookies_content(content: str):
                     data = kv_items
 
         if isinstance(data, list):
+            parsed = []
             for item in data:
                 if isinstance(item, dict):
-                    name = item.get("name")
+                    name = item.get("name") or item.get("key")
                     value = item.get("value")
+                    if value is None and "val" in item:
+                        value = item.get("val")
                     if name not in (None, "") and value is not None:
                         entry = dict(item)
                         entry["name"] = str(name).strip()
@@ -193,7 +216,6 @@ def parse_cookies_content(content: str):
         line = line.strip()
         if not line:
             continue
-        # Standard Netscape exporters (like "Get cookies.txt LOCALLY") prefix HttpOnly cookies with #HttpOnly_
         is_http_only = False
         if line.lower().startswith('#httponly_'):
             is_http_only = True
@@ -204,9 +226,9 @@ def parse_cookies_content(content: str):
         parts = line.split('\t')
         if len(parts) >= 7:
             netscape_cookies.append({
-                "domain": parts[0],
+                "domain": parts[0].strip(),
                 "flag": parts[1].upper() == "TRUE" or parts[1] == "1",
-                "path": parts[2],
+                "path": parts[2].strip(),
                 "secure": parts[3].upper() == "TRUE" or parts[3] == "1",
                 "expiration": int(parts[4]) if parts[4].lstrip('-').isdigit() else -1,
                 "name": str(parts[5]).strip(),
@@ -216,10 +238,24 @@ def parse_cookies_content(content: str):
     if netscape_cookies:
         return _finalize_cookies(netscape_cookies)
 
-    # 3. Try key=value cookie pairs (e.g. copied from browser header or text file)
-    header_clean = content_clean
-    if header_clean.lower().startswith("cookie:"):
-        header_clean = header_clean[7:].strip()
+    # 3. Extract cookie string from cURL commands or HTTP headers
+    curl_matches = re.findall(r"""(?:-H|--header)\s*['"]([Cc]ookie|Set-Cookie):\s*([^'"]+)['"]""", content_clean, re.IGNORECASE)
+    if curl_matches:
+        header_clean = "; ".join(m[1] for m in curl_matches)
+    else:
+        curl_b = re.findall(r"""(?:-b|--cookie)\s*['"]?([^'"\s]+)['"]?""", content_clean)
+        if curl_b:
+            header_clean = "; ".join(curl_b)
+        else:
+            cookie_lines = [
+                line.split(":", 1)[1].strip()
+                for line in content_clean.splitlines()
+                if line.strip().lower().startswith("cookie:") or line.strip().lower().startswith("set-cookie:")
+            ]
+            if cookie_lines:
+                header_clean = "; ".join(cookie_lines)
+            else:
+                header_clean = content_clean
 
     kv_cookies = []
     normalized = header_clean.replace('\r\n', ';').replace('\n', ';')
@@ -229,11 +265,13 @@ def parse_cookies_content(content: str):
             continue
         if item.lower().startswith("cookie:"):
             item = item[7:].strip()
+        elif item.lower().startswith("set-cookie:"):
+            item = item[11:].strip()
         if '=' in item:
             k, v = item.split('=', 1)
-            k = k.strip()
-            v = v.strip()
-            if k and v:
+            k = k.strip().strip("'\" ")
+            v = v.strip().strip("'\" ")
+            if k and v and k.lower() not in COOKIE_ATTRIBUTES:
                 kv_cookies.append({"name": k, "value": v})
     if kv_cookies:
         return _finalize_cookies(kv_cookies)
@@ -274,8 +312,13 @@ def extract_account_details(stream_obj, device_id_val, install_id_val, priority_
             if isinstance(info, dict):
                 account = info.get("account")
                 if isinstance(account, dict):
-                    # Check for session expiration
-                    if account.get("name") == "account_info_error" or account.get("error_code") in (13, 100, 101, 102):
+                    # Check for session expiration / invalid session
+                    error_code = account.get("error_code")
+                    is_error_name = account.get("name") == "account_info_error"
+                    user_id_val = str(account.get("user_id") or account.get("user_id_str") or "")
+                    desc = account.get("description") or account.get("error_desc") or ""
+
+                    if is_error_name or (error_code not in (0, "0", None)) or (user_id_val in ("0", "") and not account.get("username") and not account.get("screen_name") and not account.get("unique_id")):
                         return {
                             "username": "",
                             "screen_name": "",
@@ -284,14 +327,18 @@ def extract_account_details(stream_obj, device_id_val, install_id_val, priority_
                             "can_go_live": False,
                             "dual_layout_supported": False,
                             "status": "session_expired",
-                            "message": account.get("description") or "TikTok session expired, please sign in again."
+                            "message": desc or "TikTok session expired or invalid. Please sign in to TikTok and export fresh cookies."
                         }
 
                     username = (
                         account.get("username")
                         or account.get("unique_id")
                         or account.get("display_id")
+                        or account.get("login_name")
+                        or account.get("user_name")
                         or (account.get("screen_name") if account.get("screen_name") != "account_info_error" else "")
+                        or (account.get("nickname") if account.get("nickname") != "account_info_error" else "")
+                        or (account.get("nick_name") if account.get("nick_name") != "account_info_error" else "")
                         or (account.get("name") if account.get("name") != "account_info_error" else "")
                         or ""
                     )
@@ -312,15 +359,13 @@ def extract_account_details(stream_obj, device_id_val, install_id_val, priority_
                 status_text = info.get("status", "ready" if can_go_live else "restricted")
                 allow_dual = info.get("allow_multi_stream_scene1", False)
                 dual_layout_supported = bool(allow_dual and info.get("dual_layout_unlocked", False))
-        except RuntimeError as re:
-            err_msg = str(re)
-            if "RapidAPI" in err_msg or "signer" in err_msg:
+        except Exception as e:
+            err_msg = str(e)
+            if any(k in err_msg.lower() for k in ("rapidapi", "signer", "signature", "subscribed", "quota", "rate-limit")):
                 signer_error = err_msg
-        except Exception:
-            pass
 
     # 2. Fallback to direct passport endpoint if webcast endpoints failed or username not resolved
-    if not username and hasattr(stream_obj, "_signed_get_json") and hasattr(stream_obj, "s"):
+    if not username and hasattr(stream_obj, "s"):
         try:
             verify_fp = f"verify_{device_id_val}" if device_id_val else "verify_0"
             account_params = _apply_passport_sdk_signature({
@@ -330,14 +375,36 @@ def extract_account_details(stream_obj, device_id_val, install_id_val, priority_
                 "sdk_version": PASSPORT_WEB_SDK_VERSION,
                 "verifyFp": verify_fp,
             })
-            account_payload = stream_obj._signed_get_json(
-                build_endpoint("api.tiktokv.com", "passport/account/info/v2/", stream_obj.s),
-                params=account_params,
-                priority_region=priority_region,
-            )
+            account_payload = None
+            if hasattr(stream_obj, "_signed_get_json"):
+                try:
+                    account_payload = stream_obj._signed_get_json(
+                        build_endpoint("api.tiktokv.com", "passport/account/info/v2/", stream_obj.s),
+                        params=account_params,
+                        priority_region=priority_region,
+                    )
+                except Exception as e:
+                    err_msg = str(e)
+                    if any(k in err_msg.lower() for k in ("rapidapi", "signer", "signature", "subscribed", "quota", "rate-limit")):
+                        signer_error = err_msg
+
+            # If signed call failed or unavailable, try direct GET using session cookies
+            if not account_payload or not isinstance(account_payload.get("data"), dict):
+                try:
+                    passport_url = build_endpoint("api.tiktokv.com", "passport/account/info/v2/", stream_obj.s)
+                    raw_resp = stream_obj.s.get(passport_url, params=account_params, timeout=10)
+                    if raw_resp.status_code == 200:
+                        account_payload = raw_resp.json()
+                except Exception:
+                    pass
+
             account_data = account_payload.get("data", {}) if isinstance(account_payload, dict) else {}
-            if isinstance(account_data, dict):
-                if account_data.get("name") == "account_info_error" or account_data.get("error_code") in (13, 100, 101, 102):
+            if isinstance(account_data, dict) and account_data:
+                error_code = account_data.get("error_code")
+                is_error_name = account_data.get("name") == "account_info_error"
+                desc = account_data.get("description") or account_data.get("error_desc") or ""
+
+                if is_error_name or (error_code not in (0, "0", None)):
                     return {
                         "username": "",
                         "screen_name": "",
@@ -346,13 +413,17 @@ def extract_account_details(stream_obj, device_id_val, install_id_val, priority_
                         "can_go_live": False,
                         "dual_layout_supported": False,
                         "status": "session_expired",
-                        "message": account_data.get("description") or "TikTok session expired, please sign in again."
+                        "message": desc or "TikTok session expired or invalid. Please sign in to TikTok and export fresh cookies."
                     }
                 username = (
                     account_data.get("username")
                     or account_data.get("unique_id")
                     or account_data.get("display_id")
+                    or account_data.get("login_name")
+                    or account_data.get("user_name")
                     or (account_data.get("screen_name") if account_data.get("screen_name") != "account_info_error" else "")
+                    or (account_data.get("nickname") if account_data.get("nickname") != "account_info_error" else "")
+                    or (account_data.get("nick_name") if account_data.get("nick_name") != "account_info_error" else "")
                     or (account_data.get("name") if account_data.get("name") != "account_info_error" else "")
                     or ""
                 )
@@ -368,12 +439,10 @@ def extract_account_details(stream_obj, device_id_val, install_id_val, priority_
                 user_id = str(account_data.get("user_id_str") or account_data.get("user_id") or user_id)
                 if user_id == "0":
                     user_id = ""
-        except RuntimeError as re:
-            err_msg = str(re)
-            if "RapidAPI" in err_msg or "signer" in err_msg:
+        except Exception as e:
+            err_msg = str(e)
+            if any(k in err_msg.lower() for k in ("rapidapi", "signer", "signature", "subscribed", "quota", "rate-limit")):
                 signer_error = err_msg
-        except Exception:
-            pass
 
     # 3. Fallback to getCreateRoomInfo / anchor_info (for mock tests and backwards compatibility)
     if not username and hasattr(stream_obj, "getCreateRoomInfo"):
@@ -408,7 +477,7 @@ def extract_account_details(stream_obj, device_id_val, install_id_val, priority_
             message_text = "No TikTok session cookies found (sessionid is missing)."
         else:
             status_text = "unknown"
-            message_text = "Could not resolve TikTok username from cookies."
+            message_text = "Could not resolve TikTok username from cookies. Please ensure you are logged into TikTok."
 
     return {
         "username": username,
@@ -500,6 +569,12 @@ def config():
                 merged["close_room_when_close_stream"] = bool(data["close_room"])
             if "dual_layout" in data:
                 merged["dual_layout_supported"] = bool(data["dual_layout"])
+            if "rapidapi_key" in data:
+                global stream
+                stream = None
+                key_val = str(data["rapidapi_key"]).strip()
+                if key_val:
+                    os.environ["RAPIDAPI_KEY"] = key_val
 
             # Atomic write to avoid partial read corruption by SEI proxy
             os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
@@ -869,6 +944,9 @@ def login_cookies():
 
         stream = None  # Force re-init with new cookies on next request
 
+        session_names = {"sessionid", "sessionid_ss", "sid_tt", "sid_guard", "multi_sids"}
+        has_session = any(c.get("name") in session_names for c in parsed_cookies)
+
         details = {
             "username": "",
             "screen_name": "",
@@ -876,8 +954,8 @@ def login_cookies():
             "user_id": "",
             "can_go_live": False,
             "dual_layout_supported": False,
-            "status": "ready",
-            "message": "",
+            "status": "ready" if has_session else "no_cookies",
+            "message": "" if has_session else "No TikTok session cookies found (sessionid is missing).",
         }
 
         # In testing mode without mocked stream, avoid making real network requests with dummy cookies
